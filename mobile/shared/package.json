@@ -1,0 +1,20 @@
+{
+  "name": "@beep/shared",
+  "version": "1.0.0",
+  "description": "Shared types, socket client, and API client for Beep mobile apps",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "socket.io-client": "^4.8.3"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "beep",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "mobile/passenger",
+    "mobile/driver",
+    "mobile/shared"
+  ]
+}
