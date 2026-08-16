@@ -6,36 +6,52 @@ import {
   FIXED_PASSENGER,
   COUNTER_OFFER_CAP,
   CANCELLABLE_STATUSES,
+  type DriverLocation,
   type Ride,
   type RideLocation,
 } from '@beep/shared/dist/types';
 import { AppButton } from './components/AppButton';
 import { StatusBadge } from './components/StatusBadge';
+import { RideMap } from './components/RideMap';
+import { DriverTrackingMap } from './components/DriverTrackingMap';
+import { StarRating } from './components/StarRating';
 
-// Points at the local backend from backend/.env (PORT=3000).
-// A physical device must use the host machine's LAN IP (not localhost/10.0.2.2 —
-// those only resolve from an Android emulator). Re-check with `ipconfig` if this
-// stops working after switching networks.
-const BACKEND_URL = 'http://10.23.249.224:3000';
+// Dev builds hit the local backend over LAN (a physical device can't use
+// localhost/10.0.2.2 — those only resolve from an Android emulator; re-check with
+// `ipconfig` if this stops working after switching networks). Production builds hit
+// Render. NOTE: the backend isn't deployed yet — this is the URL it'll get from
+// render.yaml's `name: beep-backend` on first deploy; confirm it in the Render
+// dashboard and update here if the slug came out different.
+const BACKEND_URL = __DEV__ ? 'http://192.168.18.178:3000' : 'https://beep-backend.onrender.com';
 
-// Mocked locations — real pickup/dropoff selection via MapLibre/OSM lands in Phase 5.
-const MOCK_PICKUP: RideLocation = { lat: 33.8938, lng: 35.5018, label: 'Hamra' };
-const MOCK_DROPOFF: RideLocation = { lat: 33.8869, lng: 35.5131, label: 'Achrafieh' };
+type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'error';
 
-const IN_FLIGHT_STATUSES: Ride['status'][] = [
-  'CONFIRMED',
-  'DRIVER_ARRIVING',
-  'DRIVER_ARRIVED',
-  'RIDE_STARTED',
-  'RIDE_IN_PROGRESS',
-];
+const CONNECTION_LABELS: Record<ConnectionStatus, string> = {
+  connecting: 'Connecting…',
+  connected: 'Connected',
+  reconnecting: 'Reconnecting…',
+  error: 'Connection error',
+};
+
+const CONNECTION_COLORS: Record<ConnectionStatus, string> = {
+  connecting: '#F59E0B',
+  connected: '#16A34A',
+  reconnecting: '#F59E0B',
+  error: '#DC2626',
+};
 
 export default function App() {
-  const [connected, setConnected] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
+  const [showConnectionHint, setShowConnectionHint] = useState(false);
   const [ride, setRide] = useState<Ride | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [counterFare, setCounterFare] = useState('');
+  const [pickup, setPickup] = useState<RideLocation | null>(null);
+  const [dropoff, setDropoff] = useState<RideLocation | null>(null);
+  const [driverLocation, setDriverLocation] = useState<DriverLocation | null>(null);
+  const [rating, setRating] = useState(0);
   const socketRef = useRef<Socket | null>(null);
+  const hasConnectedOnce = useRef(false);
 
   useEffect(() => {
     const socket: Socket = createSocket(BACKEND_URL, {
@@ -44,9 +60,28 @@ export default function App() {
     });
     socketRef.current = socket;
 
-    socket.on('connect', () => setConnected(true));
-    socket.on('disconnect', () => setConnected(false));
-    socket.on('ride:updated', (r: Ride | null) => setRide(r));
+    socket.on('connect', () => {
+      hasConnectedOnce.current = true;
+      setConnectionStatus('connected');
+    });
+    // A server-initiated disconnect (e.g. identity_rejected) won't auto-reconnect —
+    // showing "reconnecting" there would be misleading, so treat it as an error.
+    socket.on('disconnect', (reason) => {
+      setConnectionStatus(reason === 'io server disconnect' ? 'error' : 'reconnecting');
+    });
+    socket.on('connect_error', () => setConnectionStatus('error'));
+    socket.on('identity_rejected', (payload: { reason: string }) =>
+      setNotice(`Connection rejected: ${payload.reason}`)
+    );
+    socket.io.on('reconnect_attempt', () => setConnectionStatus('reconnecting'));
+    socket.io.on('reconnect', () => setConnectionStatus('connected'));
+    socket.on('ride:updated', (r: Ride | null) => {
+      setRide(r);
+      // Last known position rides along on the ride object, so a reconnecting
+      // passenger sees it immediately instead of waiting for the next GPS tick.
+      setDriverLocation(r?.driverLocation ?? null);
+    });
+    socket.on('ride:driverLocation', (loc: DriverLocation) => setDriverLocation(loc));
     socket.on('ride:noDriverAvailable', (payload: { message: string }) => setNotice(payload.message));
     socket.on('ride:actionError', (payload: { message: string }) => setNotice(payload.message));
 
@@ -55,9 +90,27 @@ export default function App() {
     };
   }, []);
 
+  // Basic timeout UI (Phase 9): if we're not connected within a few seconds, surface
+  // a hint — most likely a Render free-tier cold start (see README) rather than a
+  // real failure, so word it as "still trying" rather than an outright error.
+  useEffect(() => {
+    if (connectionStatus === 'connected') {
+      setShowConnectionHint(false);
+      return;
+    }
+    const timer = setTimeout(() => setShowConnectionHint(true), 8000);
+    return () => clearTimeout(timer);
+  }, [connectionStatus]);
+
   const requestRide = () => {
+    if (!pickup || !dropoff) return;
     setNotice(null);
-    socketRef.current?.emit('ride:request', { pickup: MOCK_PICKUP, dropoff: MOCK_DROPOFF });
+    socketRef.current?.emit('ride:request', { pickup, dropoff });
+  };
+
+  const resetLocations = () => {
+    setPickup(null);
+    setDropoff(null);
   };
 
   const acceptOffer = () => socketRef.current?.emit('ride:accept');
@@ -74,21 +127,39 @@ export default function App() {
   };
 
   const cancelRide = () => socketRef.current?.emit('ride:cancel');
-  const dismiss = () => setRide(null);
+  const dismiss = () => {
+    setRide(null);
+    setDriverLocation(null);
+    setRating(0);
+    resetLocations();
+  };
 
   const usedOwnCounter = (ride?.counterOffersUsed.passenger ?? 0) >= COUNTER_OFFER_CAP;
 
   return (
     <ScrollView contentContainerStyle={styles.screen}>
       <View style={styles.header}>
-        <Text style={styles.appName}>Beep</Text>
+        <Text style={styles.appName}>beep</Text>
         <Text style={styles.roleTag}>Passenger</Text>
         <View style={styles.connectionRow}>
-          <View style={[styles.dot, { backgroundColor: connected ? '#16A34A' : '#DC2626' }]} />
-          <Text style={styles.connectionLabel}>{connected ? 'Connected' : 'Disconnected'}</Text>
+          <View style={[styles.dot, { backgroundColor: CONNECTION_COLORS[connectionStatus] }]} />
+          <Text style={styles.connectionLabel}>{CONNECTION_LABELS[connectionStatus]}</Text>
         </View>
         <Text style={styles.identity}>Signed in as {FIXED_PASSENGER.name}</Text>
       </View>
+
+      {connectionStatus !== 'connected' && showConnectionHint && (
+        <View style={styles.noticeBanner}>
+          <Text style={styles.noticeText}>
+            {hasConnectedOnce.current
+              ? 'Having trouble reconnecting to the server.'
+              : 'Still trying to reach the server — it may be waking up (this can take up to a minute).'}
+          </Text>
+          <View style={styles.noticeButtonSpacing}>
+            <AppButton title="Retry Now" variant="secondary" onPress={() => socketRef.current?.connect()} />
+          </View>
+        </View>
+      )}
 
       {notice && (
         <View style={styles.noticeBanner}>
@@ -99,17 +170,28 @@ export default function App() {
       {!ride && (
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Where to?</Text>
+          <RideMap pickup={pickup} dropoff={dropoff} onSetPickup={setPickup} onSetDropoff={setDropoff} />
           <View style={styles.routeRow}>
             <View style={[styles.routeDot, { backgroundColor: '#16A34A' }]} />
-            <Text style={styles.routeLabel}>{MOCK_PICKUP.label}</Text>
+            <Text style={styles.routeLabel}>
+              {pickup ? `${pickup.lat.toFixed(5)}, ${pickup.lng.toFixed(5)}` : 'Tap the map to set pickup'}
+            </Text>
           </View>
           <View style={styles.routeLine} />
           <View style={styles.routeRow}>
             <View style={[styles.routeDot, { backgroundColor: '#DC2626' }]} />
-            <Text style={styles.routeLabel}>{MOCK_DROPOFF.label}</Text>
+            <Text style={styles.routeLabel}>
+              {dropoff
+                ? `${dropoff.lat.toFixed(5)}, ${dropoff.lng.toFixed(5)}`
+                : pickup
+                  ? 'Tap the map to set dropoff'
+                  : 'Set pickup first'}
+            </Text>
           </View>
-          <Text style={styles.hint}>(Map-based pickup/dropoff selection lands in Phase 5)</Text>
-          <AppButton title="Request Ride" onPress={requestRide} />
+          <AppButton title="Request Ride" onPress={requestRide} disabled={!pickup || !dropoff} />
+          {(pickup || dropoff) && (
+            <AppButton title="Reset locations" variant="secondary" onPress={resetLocations} />
+          )}
         </View>
       )}
 
@@ -152,15 +234,36 @@ export default function App() {
         </View>
       )}
 
-      {ride && IN_FLIGHT_STATUSES.includes(ride.status) && (
+      {ride && (ride.status === 'CONFIRMED' || ride.status === 'DRIVER_ARRIVING') && (
         <View style={styles.card}>
           <StatusBadge status={ride.status} />
-          <Text style={styles.cardBody}>Ride confirmed</Text>
+          <Text style={styles.cardBody}>Driver is on the way</Text>
           <Text style={styles.fare}>${ride.agreedFare}</Text>
-          <Text style={styles.hint}>(Lifecycle screens land in Phase 7)</Text>
+          <DriverTrackingMap pickup={ride.pickup} dropoff={ride.dropoff} driverLocation={driverLocation} />
           {CANCELLABLE_STATUSES.includes(ride.status) && (
             <AppButton title="Cancel" variant="danger" onPress={cancelRide} />
           )}
+        </View>
+      )}
+
+      {ride && ride.status === 'DRIVER_ARRIVED' && (
+        <View style={styles.card}>
+          <StatusBadge status={ride.status} />
+          <Text style={styles.cardBody}>Your driver has arrived</Text>
+          <Text style={styles.fare}>${ride.agreedFare}</Text>
+          <DriverTrackingMap pickup={ride.pickup} dropoff={ride.dropoff} driverLocation={driverLocation} />
+          {CANCELLABLE_STATUSES.includes(ride.status) && (
+            <AppButton title="Cancel" variant="danger" onPress={cancelRide} />
+          )}
+        </View>
+      )}
+
+      {ride && (ride.status === 'RIDE_STARTED' || ride.status === 'RIDE_IN_PROGRESS') && (
+        <View style={styles.card}>
+          <StatusBadge status={ride.status} />
+          <Text style={styles.cardBody}>Ride in progress</Text>
+          <Text style={styles.fare}>${ride.agreedFare}</Text>
+          <DriverTrackingMap pickup={ride.pickup} dropoff={ride.dropoff} driverLocation={driverLocation} />
         </View>
       )}
 
@@ -169,7 +272,9 @@ export default function App() {
           <StatusBadge status={ride.status} />
           <Text style={styles.cardBody}>Ride completed!</Text>
           <Text style={styles.fare}>${ride.agreedFare}</Text>
-          <Text style={styles.hint}>(Ratings screen lands in Phase 8)</Text>
+          <Text style={styles.label}>Rate your driver</Text>
+          <StarRating value={rating} onChange={setRating} />
+          {rating > 0 && <Text style={styles.cardBody}>Thanks for your feedback!</Text>}
           <AppButton title="Back to start" variant="secondary" onPress={dismiss} />
         </View>
       )}
@@ -246,6 +351,9 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     textAlign: 'center',
+  },
+  noticeButtonSpacing: {
+    marginTop: 8,
   },
   card: {
     width: '100%',

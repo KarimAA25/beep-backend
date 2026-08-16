@@ -51,6 +51,12 @@ export interface RideLocation {
   label?: string;
 }
 
+// Mirrors backend/src/ride.ts's DriverLocation.
+export interface DriverLocation {
+  lat: number;
+  lng: number;
+}
+
 export interface Ride {
   id: string;
   passengerId: string;
@@ -66,6 +72,8 @@ export interface Ride {
   counterOffersUsed: { passenger: number; driver: number };
   cancelReason: string | null;
   createdAt: number;
+  // Last known driver position (Phase 6); also pushed live via ride:driverLocation.
+  driverLocation: DriverLocation | null;
 }
 
 // Matches the backend's default (NEGOTIATION_CAP env var) — only gates the UI;

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { StatusBar } from 'expo-status-bar';
-import { ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Linking, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { createSocket, type Socket } from '@beep/shared/dist/socket';
 import {
   FIXED_DRIVER,
@@ -10,12 +10,20 @@ import {
 } from '@beep/shared/dist/types';
 import { AppButton } from './components/AppButton';
 import { StatusBadge } from './components/StatusBadge';
+import { DriverMap } from './components/DriverMap';
+import {
+  setLocationSocket,
+  startDriverLocationTracking,
+  stopDriverLocationTracking,
+} from './locationTask';
 
-// Points at the local backend from backend/.env (PORT=3000).
-// A physical device must use the host machine's LAN IP (not localhost/10.0.2.2 —
-// those only resolve from an Android emulator). Re-check with `ipconfig` if this
-// stops working after switching networks.
-const BACKEND_URL = 'http://10.23.249.224:3000';
+// Dev builds hit the local backend over LAN (a physical device can't use
+// localhost/10.0.2.2 — those only resolve from an Android emulator; re-check with
+// `ipconfig` if this stops working after switching networks). Production builds hit
+// Render. NOTE: the backend isn't deployed yet — this is the URL it'll get from
+// render.yaml's `name: beep-backend` on first deploy; confirm it in the Render
+// dashboard and update here if the slug came out different.
+const BACKEND_URL = __DEV__ ? 'http://192.168.18.178:3000' : 'https://beep-backend.onrender.com';
 
 const IN_FLIGHT_STATUSES: Ride['status'][] = [
   'CONFIRMED',
@@ -25,13 +33,32 @@ const IN_FLIGHT_STATUSES: Ride['status'][] = [
   'RIDE_IN_PROGRESS',
 ];
 
+type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'error';
+
+const CONNECTION_LABELS: Record<ConnectionStatus, string> = {
+  connecting: 'Connecting…',
+  connected: 'Connected',
+  reconnecting: 'Reconnecting…',
+  error: 'Connection error',
+};
+
+const CONNECTION_COLORS: Record<ConnectionStatus, string> = {
+  connecting: '#F59E0B',
+  connected: '#16A34A',
+  reconnecting: '#F59E0B',
+  error: '#DC2626',
+};
+
 export default function App() {
-  const [connected, setConnected] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
+  const [showConnectionHint, setShowConnectionHint] = useState(false);
   const [ride, setRide] = useState<Ride | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [locationSharingBlocked, setLocationSharingBlocked] = useState(false);
   const [bidFare, setBidFare] = useState('10');
   const [counterFare, setCounterFare] = useState('');
   const socketRef = useRef<Socket | null>(null);
+  const hasConnectedOnce = useRef(false);
 
   useEffect(() => {
     const socket: Socket = createSocket(BACKEND_URL, {
@@ -39,17 +66,59 @@ export default function App() {
       role: FIXED_DRIVER.role,
     });
     socketRef.current = socket;
+    setLocationSocket(socket);
 
-    socket.on('connect', () => setConnected(true));
-    socket.on('disconnect', () => setConnected(false));
+    socket.on('connect', () => {
+      hasConnectedOnce.current = true;
+      setConnectionStatus('connected');
+    });
+    // A server-initiated disconnect (e.g. identity_rejected) won't auto-reconnect —
+    // showing "reconnecting" there would be misleading, so treat it as an error.
+    socket.on('disconnect', (reason) => {
+      setConnectionStatus(reason === 'io server disconnect' ? 'error' : 'reconnecting');
+    });
+    socket.on('connect_error', () => setConnectionStatus('error'));
+    socket.on('identity_rejected', (payload: { reason: string }) =>
+      setNotice(`Connection rejected: ${payload.reason}`)
+    );
+    socket.io.on('reconnect_attempt', () => setConnectionStatus('reconnecting'));
+    socket.io.on('reconnect', () => setConnectionStatus('connected'));
     socket.on('ride:updated', (r: Ride | null) => setRide(r));
     socket.on('ride:noDriverAvailable', (payload: { message: string }) => setNotice(payload.message));
     socket.on('ride:actionError', (payload: { message: string }) => setNotice(payload.message));
 
     return () => {
+      setLocationSocket(null);
       socket.disconnect();
     };
   }, []);
+
+  // Basic timeout UI (Phase 9): if we're not connected within a few seconds, surface
+  // a hint — most likely a Render free-tier cold start (see README) rather than a
+  // real failure, so word it as "still trying" rather than an outright error.
+  useEffect(() => {
+    if (connectionStatus === 'connected') {
+      setShowConnectionHint(false);
+      return;
+    }
+    const timer = setTimeout(() => setShowConnectionHint(true), 8000);
+    return () => clearTimeout(timer);
+  }, [connectionStatus]);
+
+  // Streams the driver's position while a ride is in flight (Phase 6); the target
+  // OS tracking call is idempotent, so re-firing across DRIVER_ARRIVING/ARRIVED/etc.
+  // doesn't restart the underlying foreground service each time.
+  useEffect(() => {
+    if (ride && IN_FLIGHT_STATUSES.includes(ride.status)) {
+      startDriverLocationTracking().then((result) => {
+        setLocationSharingBlocked(!result.ok);
+        if (!result.ok) setNotice(result.reason ?? 'Could not start location sharing.');
+      });
+    } else {
+      setLocationSharingBlocked(false);
+      stopDriverLocationTracking();
+    }
+  }, [ride?.status]);
 
   const sendBid = () => {
     const fare = Number(bidFare);
@@ -76,6 +145,9 @@ export default function App() {
   };
 
   const cancelRide = () => socketRef.current?.emit('ride:cancel');
+  const markArrived = () => socketRef.current?.emit('ride:arrived');
+  const startRide = () => socketRef.current?.emit('ride:start');
+  const completeRide = () => socketRef.current?.emit('ride:complete');
   const dismiss = () => setRide(null);
 
   const usedOwnCounter = (ride?.counterOffersUsed.driver ?? 0) >= COUNTER_OFFER_CAP;
@@ -83,16 +155,29 @@ export default function App() {
   return (
     <ScrollView contentContainerStyle={styles.screen}>
       <View style={styles.header}>
-        <Text style={styles.appName}>Beep</Text>
+        <Text style={styles.appName}>beep</Text>
         <Text style={styles.roleTag}>Driver</Text>
         <View style={styles.connectionRow}>
-          <View style={[styles.dot, { backgroundColor: connected ? '#16A34A' : '#DC2626' }]} />
-          <Text style={styles.connectionLabel}>{connected ? 'Connected' : 'Disconnected'}</Text>
+          <View style={[styles.dot, { backgroundColor: CONNECTION_COLORS[connectionStatus] }]} />
+          <Text style={styles.connectionLabel}>{CONNECTION_LABELS[connectionStatus]}</Text>
         </View>
         <Text style={styles.identity}>
           Signed in as {FIXED_DRIVER.name} · {FIXED_DRIVER.vehicleName}
         </Text>
       </View>
+
+      {connectionStatus !== 'connected' && showConnectionHint && (
+        <View style={styles.noticeBanner}>
+          <Text style={styles.noticeText}>
+            {hasConnectedOnce.current
+              ? 'Having trouble reconnecting to the server.'
+              : 'Still trying to reach the server — it may be waking up (this can take up to a minute).'}
+          </Text>
+          <View style={styles.noticeButtonSpacing}>
+            <AppButton title="Retry Now" variant="secondary" onPress={() => socketRef.current?.connect()} />
+          </View>
+        </View>
+      )}
 
       {notice && (
         <View style={styles.noticeBanner}>
@@ -103,6 +188,7 @@ export default function App() {
       {!ride && (
         <View style={styles.card}>
           <Text style={styles.cardTitle}>No active requests</Text>
+          <DriverMap />
           <Text style={styles.cardBody}>Waiting for a ride request…</Text>
         </View>
       )}
@@ -112,12 +198,16 @@ export default function App() {
           <StatusBadge status={ride.status} />
           <View style={styles.routeRow}>
             <View style={[styles.routeDot, { backgroundColor: '#16A34A' }]} />
-            <Text style={styles.routeLabel}>{ride.pickup.label}</Text>
+            <Text style={styles.routeLabel}>
+              {ride.pickup.label ?? `${ride.pickup.lat.toFixed(5)}, ${ride.pickup.lng.toFixed(5)}`}
+            </Text>
           </View>
           <View style={styles.routeLine} />
           <View style={styles.routeRow}>
             <View style={[styles.routeDot, { backgroundColor: '#DC2626' }]} />
-            <Text style={styles.routeLabel}>{ride.dropoff.label}</Text>
+            <Text style={styles.routeLabel}>
+              {ride.dropoff.label ?? `${ride.dropoff.lat.toFixed(5)}, ${ride.dropoff.lng.toFixed(5)}`}
+            </Text>
           </View>
           <Text style={styles.label}>Your bid ($)</Text>
           <TextInput
@@ -162,15 +252,55 @@ export default function App() {
         </View>
       )}
 
-      {ride && IN_FLIGHT_STATUSES.includes(ride.status) && (
+      {ride && (ride.status === 'CONFIRMED' || ride.status === 'DRIVER_ARRIVING') && (
         <View style={styles.card}>
           <StatusBadge status={ride.status} />
-          <Text style={styles.cardBody}>Ride confirmed</Text>
+          <Text style={styles.cardBody}>Heading to pickup</Text>
           <Text style={styles.fare}>${ride.agreedFare}</Text>
-          <Text style={styles.hint}>(Lifecycle buttons land in Phase 7)</Text>
+          {locationSharingBlocked && (
+            <AppButton title="Open Location Settings" variant="secondary" onPress={() => Linking.openSettings()} />
+          )}
+          <AppButton
+            title="I've Arrived"
+            variant="success"
+            disabled={ride.status !== 'DRIVER_ARRIVING'}
+            onPress={markArrived}
+          />
           {CANCELLABLE_STATUSES.includes(ride.status) && (
             <AppButton title="Cancel" variant="danger" onPress={cancelRide} />
           )}
+        </View>
+      )}
+
+      {ride && ride.status === 'DRIVER_ARRIVED' && (
+        <View style={styles.card}>
+          <StatusBadge status={ride.status} />
+          <Text style={styles.cardBody}>You've arrived at pickup</Text>
+          <Text style={styles.fare}>${ride.agreedFare}</Text>
+          {locationSharingBlocked && (
+            <AppButton title="Open Location Settings" variant="secondary" onPress={() => Linking.openSettings()} />
+          )}
+          <AppButton title="Start Ride" variant="success" onPress={startRide} />
+          {CANCELLABLE_STATUSES.includes(ride.status) && (
+            <AppButton title="Cancel" variant="danger" onPress={cancelRide} />
+          )}
+        </View>
+      )}
+
+      {ride && (ride.status === 'RIDE_STARTED' || ride.status === 'RIDE_IN_PROGRESS') && (
+        <View style={styles.card}>
+          <StatusBadge status={ride.status} />
+          <Text style={styles.cardBody}>Ride in progress</Text>
+          <Text style={styles.fare}>${ride.agreedFare}</Text>
+          {locationSharingBlocked && (
+            <AppButton title="Open Location Settings" variant="secondary" onPress={() => Linking.openSettings()} />
+          )}
+          <AppButton
+            title="Complete Ride"
+            variant="success"
+            disabled={ride.status !== 'RIDE_IN_PROGRESS'}
+            onPress={completeRide}
+          />
         </View>
       )}
 
@@ -255,6 +385,9 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     textAlign: 'center',
+  },
+  noticeButtonSpacing: {
+    marginTop: 8,
   },
   card: {
     width: '100%',

@@ -20,6 +20,11 @@ export interface RideLocation {
   label?: string;
 }
 
+export interface DriverLocation {
+  lat: number;
+  lng: number;
+}
+
 export interface Ride {
   id: string;
   passengerId: string;
@@ -37,6 +42,12 @@ export interface Ride {
   counterOffersUsed: { passenger: number; driver: number };
   cancelReason: string | null;
   createdAt: number;
+  // Last known driver position (Phase 6). Updated directly, not via broadcast() —
+  // GPS ticks are relayed through the separate ride:driverLocation event so they
+  // don't spam the status-transition log or force a full ride re-render. Riding
+  // along on the Ride object just means a reconnecting passenger gets the last
+  // known position immediately via the existing ride:updated-on-connect push.
+  driverLocation: DriverLocation | null;
 }
 
 interface Identity {
@@ -60,6 +71,16 @@ const CANCELLABLE_STATUSES: RideStatus[] = [
   "CONFIRMED",
   "DRIVER_ARRIVING",
   "DRIVER_ARRIVED",
+];
+
+// Statuses where a driver is committed to the ride and en route/on it — mirrors
+// IN_FLIGHT_STATUSES in both mobile apps' App.tsx; keep the two in sync.
+const DRIVER_TRACKING_STATUSES: RideStatus[] = [
+  "CONFIRMED",
+  "DRIVER_ARRIVING",
+  "DRIVER_ARRIVED",
+  "RIDE_STARTED",
+  "RIDE_IN_PROGRESS",
 ];
 
 export function rideRoomName(rideId: string): string {
@@ -170,6 +191,7 @@ export function registerRideHandlers(io: Server, socket: Socket, identity: Ident
         counterOffersUsed: { passenger: 0, driver: 0 },
         cancelReason: null,
         createdAt: Date.now(),
+        driverLocation: null,
       };
       activeRide = ride;
 
@@ -290,5 +312,18 @@ export function registerRideHandlers(io: Server, socket: Socket, identity: Ident
     if (identity.role !== "driver" || !activeRide || activeRide.status !== "RIDE_IN_PROGRESS") return;
     if (activeRide.driverId !== identity.userId) return;
     finishRide(io, "RIDE_COMPLETED");
+  });
+
+  // High-frequency GPS stream (Phase 6) — deliberately bypasses broadcast(): no
+  // status-transition log spam, no full-ride re-render per tick, and no
+  // ride:actionError feedback for a bad tick (this isn't a one-off user action).
+  socket.on("ride:driverLocationUpdate", (payload: DriverLocation) => {
+    if (identity.role !== "driver" || !activeRide) return;
+    if (activeRide.driverId !== identity.userId) return;
+    if (!DRIVER_TRACKING_STATUSES.includes(activeRide.status)) return;
+    if (!payload || typeof payload.lat !== "number" || typeof payload.lng !== "number") return;
+
+    activeRide.driverLocation = { lat: payload.lat, lng: payload.lng };
+    socket.to(rideRoomName(activeRide.id)).emit("ride:driverLocation", activeRide.driverLocation);
   });
 }
